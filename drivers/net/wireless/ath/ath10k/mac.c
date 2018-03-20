@@ -1237,6 +1237,36 @@ static int ath10k_monitor_recalc(struct ath10k *ar)
 		return ath10k_monitor_stop(ar);
 }
 
+static bool ath10k_mac_can_set_cts_prot(struct ath10k_vif *arvif)
+{
+	struct ath10k *ar = arvif->ar;
+
+	lockdep_assert_held(&ar->conf_mutex);
+
+	if (!arvif->is_started) {
+		ath10k_dbg(ar, ATH10K_DBG_MAC, "defer cts setup, vdev is not ready yet\n");
+		return false;
+	}
+
+	return true;
+}
+
+static int ath10k_mac_set_cts_prot(struct ath10k_vif *arvif)
+{
+	struct ath10k *ar = arvif->ar;
+	u32 vdev_param;
+
+	lockdep_assert_held(&ar->conf_mutex);
+
+	vdev_param = ar->wmi.vdev_param->protection_mode;
+
+	ath10k_dbg(ar, ATH10K_DBG_MAC, "mac vdev %d cts_protection %d\n",
+		   arvif->vdev_id, arvif->use_cts_prot);
+
+	return ath10k_wmi_vdev_set_param(ar, arvif->vdev_id, vdev_param,
+					 arvif->use_cts_prot ? 1 : 0);
+}
+
 static int ath10k_recalc_rtscts_prot(struct ath10k_vif *arvif)
 {
 	struct ath10k *ar = arvif->ar;
@@ -3704,6 +3734,7 @@ void ath10k_mgmt_over_wmi_tx_work(struct work_struct *work)
 {
 	struct ath10k *ar = container_of(work, struct ath10k, wmi_mgmt_tx_work);
 	struct sk_buff *skb;
+	dma_addr_t paddr;
 	int ret;
 
 	for (;;) {
@@ -3711,11 +3742,26 @@ void ath10k_mgmt_over_wmi_tx_work(struct work_struct *work)
 		if (!skb)
 			break;
 
-		ret = ath10k_wmi_mgmt_tx(ar, skb);
-		if (ret) {
-			ath10k_warn(ar, "failed to transmit management frame via WMI: %d\n",
-				    ret);
-			ieee80211_free_txskb(ar->hw, skb);
+		if (QCA_REV_WCN3990(ar)) {
+			paddr = dma_map_single(ar->dev, skb->data,
+					       skb->len, DMA_TO_DEVICE);
+			if (!paddr)
+				continue;
+			ret = ath10k_wmi_mgmt_tx_send(ar, skb, paddr);
+			if (ret) {
+				ath10k_warn(ar, "failed to transmit management frame by ref via WMI: %d\n",
+					    ret);
+				dma_unmap_single(ar->dev, paddr, skb->len,
+						 DMA_FROM_DEVICE);
+				ieee80211_free_txskb(ar->hw, skb);
+			}
+		} else {
+			ret = ath10k_wmi_mgmt_tx(ar, skb);
+			if (ret) {
+				ath10k_warn(ar, "failed to transmit management frame via WMI: %d\n",
+					    ret);
+				ieee80211_free_txskb(ar->hw, skb);
+			}
 		}
 	}
 }
@@ -5390,20 +5436,18 @@ static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
 
 	if (changed & BSS_CHANGED_ERP_CTS_PROT) {
 		arvif->use_cts_prot = info->use_cts_prot;
-		ath10k_dbg(ar, ATH10K_DBG_MAC, "mac vdev %d cts_prot %d\n",
-			   arvif->vdev_id, info->use_cts_prot);
 
 		ret = ath10k_recalc_rtscts_prot(arvif);
 		if (ret)
 			ath10k_warn(ar, "failed to recalculate rts/cts prot for vdev %d: %d\n",
 				    arvif->vdev_id, ret);
 
-		vdev_param = ar->wmi.vdev_param->protection_mode;
-		ret = ath10k_wmi_vdev_set_param(ar, arvif->vdev_id, vdev_param,
-						info->use_cts_prot ? 1 : 0);
-		if (ret)
-			ath10k_warn(ar, "failed to set protection mode %d on vdev %i: %d\n",
-				    info->use_cts_prot, arvif->vdev_id, ret);
+		if (ath10k_mac_can_set_cts_prot(arvif)) {
+			ret = ath10k_mac_set_cts_prot(arvif);
+			if (ret)
+				ath10k_warn(ar, "failed to set cts protection for vdev %d: %d\n",
+					    arvif->vdev_id, ret);
+		}
 	}
 
 	if (changed & BSS_CHANGED_ERP_SLOT) {
@@ -7465,6 +7509,13 @@ ath10k_mac_op_assign_vif_chanctx(struct ieee80211_hw *hw,
 		}
 
 		arvif->is_up = true;
+	}
+
+	if (ath10k_mac_can_set_cts_prot(arvif)) {
+		ret = ath10k_mac_set_cts_prot(arvif);
+		if (ret)
+			ath10k_warn(ar, "failed to set cts protection for vdev %d: %d\n",
+				    arvif->vdev_id, ret);
 	}
 
 	mutex_unlock(&ar->conf_mutex);
