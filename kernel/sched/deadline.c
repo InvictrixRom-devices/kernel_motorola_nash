@@ -1135,11 +1135,6 @@ static void dequeue_dl_entity(struct sched_dl_entity *dl_se)
 	__dequeue_dl_entity(dl_se);
 }
 
-static inline bool dl_is_constrained(struct sched_dl_entity *dl_se)
-{
-	return dl_se->dl_deadline < dl_se->dl_period;
-}
-
 static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct task_struct *pi_task = rt_mutex_get_top_task(p);

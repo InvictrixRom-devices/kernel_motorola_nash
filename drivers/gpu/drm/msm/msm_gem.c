@@ -242,13 +242,13 @@ static struct page **get_pages(struct drm_gem_object *obj)
 		if (IS_ERR(msm_obj->sgt)) {
 			void *ptr = ERR_CAST(msm_obj->sgt);
 
-			dev_err(dev->dev, "failed to allocate sgt\n");
 			msm_obj->sgt = NULL;
 			return ptr;
 		}
 
-		/* For non-cached buffers, ensure the new pages are clean
-		 * because display controller, GPU, etc. are not coherent:
+		/*
+		 * Make sure to flush the CPU cache for newly allocated memory
+		 * so we don't get ourselves into trouble with a dirty cache
 		 */
 		if (msm_obj->flags & (MSM_BO_WC|MSM_BO_UNCACHED))
 			dma_sync_sg_for_device(dev->dev, msm_obj->sgt->sgl,
@@ -290,16 +290,13 @@ static void put_pages(struct drm_gem_object *obj)
 
 	if (msm_obj->pages) {
 
-		/* For non-cached buffers, ensure the new pages are clean
-		 * because display controller, GPU, etc. are not coherent:
-		 */
-		if (msm_obj->flags & (MSM_BO_WC|MSM_BO_UNCACHED))
-			dma_unmap_sg(obj->dev->dev, msm_obj->sgt->sgl,
-					msm_obj->sgt->nents, DMA_BIDIRECTIONAL);
+		if (msm_obj->flags & MSM_BO_LOCKED) {
+			unprotect_pages(msm_obj);
+			msm_obj->flags &= ~MSM_BO_LOCKED;
+		}
 
 		if (msm_obj->sgt)
 			sg_free_table(msm_obj->sgt);
-
 		kfree(msm_obj->sgt);
 
 		if (use_pages(obj)) {
